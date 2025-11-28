@@ -575,9 +575,6 @@ static int run_cli(int argc, char **argv) {
 		unsigned short NrOfCh = 0;
 		int haveChannelCount = 0;
 
-		/* ------------------------------------------------------------------
-		   1) 우선 보드 존재 확인 API 시도 (지원되는 장비/슬롯이면 여기서 끝남)
-		   ------------------------------------------------------------------ */
 		{
 			unsigned short serNumb = 0;
 			unsigned char fmwMin = 0, fmwMax = 0;
@@ -598,10 +595,7 @@ static int run_cli(int argc, char **argv) {
 			}
 		}
 
-		/* ------------------------------------------------------------------
-		   2) TestBdPresence 가 INVALIDPARAMETER/NOTAVAILABLE 이면
-		      CrateMap 으로 채널 수를 얻어보는 fallback
-		   ------------------------------------------------------------------ */
+
 		if(!haveChannelCount) {
 			unsigned short nrSlots = 0;
 			unsigned short *nrChList = NULL;
@@ -633,10 +627,6 @@ static int run_cli(int argc, char **argv) {
 			if(fmwMaxList)   CAENHV_Free(fmwMaxList);
 		}
 
-		/* ------------------------------------------------------------------
-		   3) 그래도 채널 수를 못 얻었다면, config 파일의 채널 목록을 사용
-		      (수동으로 --ch 0 1 2 ... 준 것과 같은 효과)
-		   ------------------------------------------------------------------ */
 		if(!haveChannelCount) {
 			unsigned short *cfgCh = NULL;
 			float *cfgV0 = NULL;
@@ -659,13 +649,11 @@ static int run_cli(int argc, char **argv) {
 				return 2;
 			}
 
-			/* config 에서 읽어온 채널 목록 사용 (이미 exclude 반영됨) */
 			chList = cfgCh;
 			chCount = cfgCount;
 			free(cfgV0);
 			free(cfgI0);
 		} else {
-			/* NrOfCh 를 알고 있을 때: 0 ~ NrOfCh-1 사이를 수동 지정과 동일하게 사용 */
 			unsigned short includeCount = 0;
 			for(unsigned short c = 0; c < NrOfCh; c++)
 				if(!is_channel_excluded(c))
