@@ -1,7 +1,7 @@
 ## CAENHVWrapper
 
 Small helper CLI built on top of the official **CAEN HV Wrapper 6.6** library.  
-It is mainly used to control CAEN SY2527 (and compatible HV systems) from the command line:  
+It is mainly used to control CAEN SY4527 (and compatible HV systems) from the command line:  
 set per‑channel voltage/current, turn channels on/off, and read monitoring values.
 
 ### Installation
@@ -9,7 +9,6 @@ set per‑channel voltage/current, turn channels on/off, and read monitoring val
 - Install the library and header (root privileges required):
 
 ```bash
-cd /home/yoolab/Downloads/CAENHVWrapper-6.6
 sudo ./install.sh
 ```
 
@@ -17,6 +16,7 @@ sudo ./install.sh
 
 ```bash
 cd HVWrapperDemo
+make clean
 make all
 ```
 
@@ -48,7 +48,7 @@ ch name V0Set I0Set
 Examples:
 
 ```bash
-./HVWrappdemo --Pw On    # Apply V0Set/I0Set from config to listed channels, then turn them ON
+./HVWrappdemo --Pw On    # Apply or Modify V0Set/I0Set from config, then turn them ON
 ./HVWrappdemo --Pw Off   # Turn the same channels OFF
 ```
 

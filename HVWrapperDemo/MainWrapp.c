@@ -23,21 +23,29 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdint.h>
 #include "MainWrapp.h"
 #include "console.h"
 #include "CAENHVWrapper.h"
 
 #define MAX_CMD_LEN        (80)
 
+/* Common error/capacity macros (no behavior change; only deduplicate checks) */
+#define CHECK_ALLOC_RETURN(ptr) \
+	do { if(!(ptr)) { fprintf(stderr, "Out of memory\n"); return 3; } } while(0)
+
+#define CHECK_ALLOC_SETEXIT(ptr, exitVar) \
+	do { if(!(ptr)) { fprintf(stderr, "Out of memory\n"); if((exitVar)==0) (exitVar)=3; } } while(0)
+
 /* =========================
    Default CLI configuration
    ========================= */
-#define DEFAULT_SYSTEM	SY2527
+#define DEFAULT_SYSTEM	SY4527
 #define DEFAULT_LINK	LINKTYPE_TCPIP
-#define DEFAULT_HOST	"192.168.1.2"
+#define DEFAULT_HOST	"192.168.0.1"
 #define DEFAULT_USER	"admin"
 #define DEFAULT_PASS	"admin"
-#define DEFAULT_SLOT	1
+#define DEFAULT_SLOT	3
 
 /* ----------------------------------------
    Channels to exclude when using '--ch all'
@@ -56,8 +64,7 @@ static int is_channel_excluded(unsigned short ch)
 }
 
 /* Default config file paths (first existing one will be used) */
-#define DEFAULT_CONFIG_PATH1 "../config/config.txt"
-#define DEFAULT_CONFIG_PATH2 "config.txt"
+#define DEFAULT_CONFIG_PATH "../config/config.txt"
 
 /* strict token parsers to validate numeric fields (avoid treating headers as data) */
 static int parse_ushort_token(const char *s, unsigned short *out)
@@ -84,10 +91,13 @@ static int parse_float_token(const char *s, float *out)
 /* ----------------------------------------
    Config file loader
    Format (whitespace or commas as separators):
-     ch#   chName   V0Set   I0Set
-   chName is ignored by the program.
+     ch#   chName   V0Set   I0Set   [SVMax]
+   chName is used for display purposes only (not written back).
    ---------------------------------------- */
-static int load_config_file(const char *path, unsigned short **outChList, int *outCount, float **outV0List, float **outI0List)
+static int load_config_file(const char *path,
+	unsigned short **outChList, int *outCount,
+	float **outV0List, float **outI0List,
+	float **outSVMaxList, char ***outNameList)
 {
 	FILE *fp = fopen(path, "r");
 	if(!fp) return -1;
@@ -95,6 +105,8 @@ static int load_config_file(const char *path, unsigned short **outChList, int *o
 	unsigned short *chVec = NULL;
 	float *v0Vec = NULL;
 	float *i0Vec = NULL;
+	float *svVec = NULL;
+	char **nameVec = NULL;
 	int cap = 0;
 	int len = 0;
 	char line[1024];
@@ -114,9 +126,10 @@ static int load_config_file(const char *path, unsigned short **outChList, int *o
 		if(!parse_ushort_token(tok, &ch))
 			continue; /* header or invalid first token: skip line */
 
-		/* second token: chName (ignored) */
+		/* second token: chName (kept for display) */
 		tok = strtok(NULL, delims);
 		if(!tok) continue;
+		const char *nameTok = tok;
 
 		/* third: V0Set */
 		tok = strtok(NULL, delims);
@@ -132,6 +145,14 @@ static int load_config_file(const char *path, unsigned short **outChList, int *o
 		if(!parse_float_token(tok, &i0))
 			continue;
 
+		/* fifth: optional SVMax */
+		tok = strtok(NULL, delims);
+		float svmax = 0.0f;
+		int hasSV = 0;
+		if(tok && parse_float_token(tok, &svmax)) {
+			hasSV = 1;
+		}
+
 		if(is_channel_excluded((unsigned short)ch))
 			continue;
 
@@ -140,24 +161,42 @@ static int load_config_file(const char *path, unsigned short **outChList, int *o
 			unsigned short *nch = (unsigned short*)realloc(chVec, sizeof(unsigned short) * (size_t)ncap);
 			float *nv0 = (float*)realloc(v0Vec, sizeof(float) * (size_t)ncap);
 			float *ni0 = (float*)realloc(i0Vec, sizeof(float) * (size_t)ncap);
-			if(!nch || !nv0 || !ni0) {
+			float *nsv = (float*)realloc(svVec, sizeof(float) * (size_t)ncap);
+			char **nname = (char**)realloc(nameVec, sizeof(char*) * (size_t)ncap);
+			if(!nch || !nv0 || !ni0 || !nsv || !nname) {
 				if(nch) chVec = nch;
 				if(nv0) v0Vec = nv0;
 				if(ni0) i0Vec = ni0;
+				if(nsv) svVec = nsv;
+				if(nname) nameVec = nname;
 				fclose(fp);
 				free(chVec);
 				free(v0Vec);
 				free(i0Vec);
+				free(svVec);
+				if(nameVec) {
+					for(int ii = 0; ii < len; ii++) free(nameVec[ii]);
+				}
+				free(nameVec);
 				return -2;
 			}
 			chVec = nch;
 			v0Vec = nv0;
 			i0Vec = ni0;
+			svVec = nsv;
+			nameVec = nname;
 			cap = ncap;
 		}
 		chVec[len] = (unsigned short)ch;
 		v0Vec[len] = v0;
 		i0Vec[len] = i0;
+		svVec[len] = hasSV ? svmax : 0.0f;
+		/* copy name token */
+		size_t nlen = strlen(nameTok);
+		nameVec[len] = (char*)malloc(nlen + 1);
+		if(nameVec[len]) {
+			memcpy(nameVec[len], nameTok, nlen + 1);
+		}
 		len++;
 	}
 	fclose(fp);
@@ -166,21 +205,32 @@ static int load_config_file(const char *path, unsigned short **outChList, int *o
 		free(chVec);
 		free(v0Vec);
 		free(i0Vec);
+		free(svVec);
+		if(nameVec) {
+			/* No entries; but ensure no leak */
+			free(nameVec);
+		}
 		return 0;
 	}
 
 	*outChList = chVec;
 	*outV0List = v0Vec;
 	*outI0List = i0Vec;
+	if(outSVMaxList) *outSVMaxList = svVec; else free(svVec);
+	if(outNameList) *outNameList = nameVec; else {
+		if(nameVec) {
+			for(int ii = 0; ii < len; ii++) free(nameVec[ii]);
+			free(nameVec);
+		}
+	}
 	*outCount = len;
 	return len;
 }
 
-static int load_default_config(unsigned short **outChList, int *outCount, float **outV0List, float **outI0List)
+static int load_default_config(unsigned short **outChList, int *outCount,
+	float **outV0List, float **outI0List, float **outSVMaxList, char ***outNameList)
 {
-	int r = load_config_file(DEFAULT_CONFIG_PATH1, outChList, outCount, outV0List, outI0List);
-	if(r >= 0) return r;
-	return load_config_file(DEFAULT_CONFIG_PATH2, outChList, outCount, outV0List, outI0List);
+	return load_config_file(DEFAULT_CONFIG_PATH, outChList, outCount, outV0List, outI0List, outSVMaxList, outNameList);
 }
 
 typedef void (*P_FUN)(void);
@@ -365,33 +415,137 @@ static int is_flag(const char *s) {
 	return (s && s[0] == '-' && s[1] == '-');
 }
 
+/* Simple whitespace trim helper */
+static char *trim_ws(char *s) {
+	while(*s == ' ' || *s == '\t') s++;
+	char *e = s + strlen(s);
+	while(e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = '\0';
+	return s;
+}
+
+/* Read connection defaults from channel config file header (before data rows).
+   Supported keys: system, link, host, user, pass, slot
+   Format: key=value or 'key value', ignores lines starting with '#' or ';'
+   Stops when reaches a row starting with 'ch' header or a numeric channel index. */
+static int read_conn_from_ch_config(const char *path,
+	CAENHV_SYSTEM_TYPE_t *outSystem,
+	int *outLinkType,
+	char *outHost, size_t outHostLen,
+	char *outUser, size_t outUserLen,
+	char *outPass, size_t outPassLen,
+	int *outSlot)
+{
+	FILE *fp = fopen(path, "r");
+	if(!fp) return 0;
+	int mask = 0;
+	char line[512];
+	while(fgets(line, sizeof(line), fp)) {
+		char *p = trim_ws(line);
+		if(*p == '\0' || *p == '#' || *p == ';') continue;
+		if(!strncasecmp(p, "ch", 2)) break; /* header row */
+		/* stop if first token is numeric (channel row) */
+		char tok[32] = {0};
+		if(sscanf(p, " %31s", tok) == 1) {
+			unsigned short tch;
+			if(parse_ushort_token(tok, &tch)) break;
+		}
+		/* parse key=value or key value */
+		char key[64] = {0}, val[256] = {0};
+		if(sscanf(p, " %63[^=]=%255[^\n]", key, val) != 2) {
+			if(sscanf(p, " %63s %255s", key, val) != 2) continue;
+		}
+		char *k = trim_ws(key), *v = trim_ws(val);
+		if(str_ieq(k, "system")) {
+			CAENHV_SYSTEM_TYPE_t st;
+			if(parse_system_type(v, &st) == 0 && outSystem) { *outSystem = st; mask |= 1; }
+		} else if(str_ieq(k, "link")) {
+			int lt;
+			if(parse_link_type(v, &lt) == 0 && outLinkType) { *outLinkType = lt; mask |= 2; }
+		} else if(str_ieq(k, "host")) {
+			if(outHost && outHostLen) { snprintf(outHost, outHostLen, "%s", v); mask |= 4; }
+		} else if(str_ieq(k, "user")) {
+			if(outUser && outUserLen) { snprintf(outUser, outUserLen, "%s", v); mask |= 8; }
+		} else if(str_ieq(k, "pass") || str_ieq(k, "password")) {
+			if(outPass && outPassLen) { snprintf(outPass, outPassLen, "%s", v); mask |= 16; }
+		} else if(str_ieq(k, "slot")) {
+			int s = atoi(v);
+			if(outSlot && s >= 0) { *outSlot = s; mask |= 32; }
+		}
+	}
+	fclose(fp);
+	return mask;
+}
+
+/* Map Status bitfield to a concise human-readable label */
+static const char *status_label(uint32_t v) {
+	if(v & (1u << 3))  return "Over Current";
+	if(v & (1u << 4))  return "Over Voltage";
+	if(v & (1u << 9))  return "Internal Trip";
+	if(v & (1u << 6))  return "External Trip";
+	if(v & (1u << 15)) return "Temperature Error";
+	if(v & (1u << 14)) return "Power Failure";
+	if(v & (1u << 13)) return "Over Voltage Protection";
+	if(v & (1u << 5))  return "Under Voltage";
+	if(v & (1u << 7))  return "Max Voltage";
+	if(v & (1u << 8))  return "External Disable";
+	if(v & (1u << 10)) return "Calibration Error";
+	if(v & (1u << 11)) return "Unplugged";
+	if(v & (1u << 1))  return "Up";
+	if(v & (1u << 2))  return "Down";
+	if(v & (1u << 0))  return "On";
+	return "Off";
+}
+
+/* Append a getter parameter to the list with capacity check */
+static int add_get_param(const char *par, const char **arr, int *count, int max) {
+	if(*count >= max) {
+		fprintf(stderr, "Too many getter parameters\n");
+		return -1;
+	}
+	arr[(*count)++] = par;
+	return 0;
+}
+
+/* Append a setter parameter (name,value) with capacity check */
+static int add_set_param(cli_param_t *params, int *count, int max, const char *name, const char *value) {
+	if(*count >= max) {
+		fprintf(stderr, "Too many parameters specified\n");
+		return -1;
+	}
+	snprintf(params[*count].name, sizeof(params[*count].name), "%s", name);
+	snprintf(params[*count].value, sizeof(params[*count].value), "%s", value ? value : "");
+	(*count)++;
+	return 0;
+}
+
+/* Parameters that support both read and write: allow bare '--Param' to mean '--get Param' */
+static int is_readwrite_param(const char *name) {
+	if(name == NULL || *name == '\0') return 0;
+	if(str_ieq(name, "RUp"))    return 1;
+	if(str_ieq(name, "RDWn"))   return 1;
+	if(str_ieq(name, "V0Set"))  return 1;
+	if(str_ieq(name, "I0Set"))  return 1;
+	if(str_ieq(name, "SVMax"))  return 1;
+	if(str_ieq(name, "Pw"))     return 1;
+	if(str_ieq(name, "Trip"))   return 1;
+	return 0;
+}
+
 static void print_cli_usage(const char *prog) {
-	fprintf(stderr,
-		"Usage (CLI mode): %s --ch 0 1 2 3 \\\n"
-		"                  --V0Set 650 --Pw On\n"
-		"       (read)     %s --ch 0 1 --IMon\n"
-		"       (read)     %s --ch 0 1 --VMon\n"
-		"       (read)     %s --ch 0 1 --ChStatus\n"
-		"       (read all) %s --ch all --IMon\n"
-		"       (read all) %s --ch all --VMon\n"
-		"       (read all) %s --ch all --ChStatus\n"
-		"       (Pw all)   %s --ch all --Pw On | Off\n"
-		"       (Pw all)   %s --ch all --PwOn | --PwOff\n"
-		"       (config)   %s --Pw On|Off   (reads per-channel V0Set/I0Set from config)\n"
-		"\n"
-		"Notes:\n"
-		"- Connection is fixed to TCP/IP host 192.168.1.2.\n"
-		"- System is fixed to SY2527. Login is fixed to admin/admin. Slot is fixed to 1.\n"
-		"- You can provide multiple parameter assignments: any --<ParamName> <value> is applied to all channels.\n"
-		"- If no arguments are provided, the interactive ncurses demo UI is started.\n",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo",
-		prog ? prog : "HVWrappdemo");
+	const char *p = (prog && *prog) ? prog : "HVWrappdemo";
+	fprintf(stderr, "Usage (CLI mode): %s --ch 0 1 2 3 --V0Set 650 --Pw On\n", p);
+	fprintf(stderr, "       (Setting)  %s --host 192.168.0.1 [--slot 3]\n", p);
+	fprintf(stderr, "       (read)     %s --ch 0 1 --IMon\n", p);
+	fprintf(stderr, "       (read)     %s --ch 0 1 --VMon\n", p);
+	fprintf(stderr, "       (read)     %s --ch 0 1 --Status\n", p);
+	fprintf(stderr, "       (read all) %s --ch all --IMon\n", p);
+	fprintf(stderr, "       (read all) %s --ch all --VMon\n", p);
+	fprintf(stderr, "       (read all) %s --ch all --Status\n", p);
+	fprintf(stderr, "\nNotes:\n");
+	fprintf(stderr, "- Connection defaults to TCP/IP host " DEFAULT_HOST ". Override with --host.\n");
+	fprintf(stderr, "- System defaults to SY4527. Login defaults to admin/admin. Slot has a project default.\n");
+	fprintf(stderr, "- You can provide multiple parameter assignments: any --<ParamName> <value> is applied to all channels.\n");
+	fprintf(stderr, "- If no arguments are provided, the interactive ncurses demo UI is started.\n");
 }
 
 static int run_cli(int argc, char **argv) {
@@ -400,14 +554,19 @@ static int run_cli(int argc, char **argv) {
 	const char *user = NULL;
 	const char *pass = NULL;
 	int slot = -1;
+	const char *host = DEFAULT_HOST;
 	unsigned short *chList = NULL;
 	int chCount = 0;
 	cli_param_t params[32];
 	int paramCount = 0;
-	const char *getParam = NULL;
+	const char *getParams[32];
+	int getCount = 0;
 	int chAll = 0;
 	const char *configPath = NULL;
 	int i;
+	/* Persistent buffers for config header values and CLI host flag */
+	char cfgHost[256] = {0}, cfgUser[64] = {0}, cfgPass[64] = {0};
+	int cliHostProvided = 0;
 
 	for(i = 1; i < argc; i++) {
 		if(str_ieq(argv[i], "--help")) {
@@ -423,34 +582,26 @@ static int run_cli(int argc, char **argv) {
 			user = argv[++i];
 		} else if(str_ieq(argv[i], "--pass") && i+1 < argc) {
 			pass = argv[++i];
+		} else if(str_ieq(argv[i], "--host") && i+1 < argc) {
+			host = argv[++i];
+			cliHostProvided = 1;
 		} else if(str_ieq(argv[i], "--slot") && i+1 < argc) {
 			slot = atoi(argv[++i]);
 		} else if(str_ieq(argv[i], "--config") && i+1 < argc) {
 			configPath = argv[++i];
 		} else if(str_ieq(argv[i], "--get") && i+1 < argc) {
-			getParam = argv[++i];
+			if(add_get_param(argv[i+1], getParams, &getCount, (int)(sizeof(getParams)/sizeof(getParams[0]))) != 0)
+				return 2;
+			i++;
 		} else if(str_ieq(argv[i], "--IMon")) {
-			getParam = "IMon";
+			if(add_get_param("IMon", getParams, &getCount, (int)(sizeof(getParams)/sizeof(getParams[0]))) != 0)
+				return 2;
 		} else if(str_ieq(argv[i], "--VMon")) {
-			getParam = "VMon";
-		} else if(str_ieq(argv[i], "--ChStatus")) {
-			getParam = "ChStatus";
-		} else if(str_ieq(argv[i], "--PwOn")) {
-			if(paramCount >= (int)(sizeof(params)/sizeof(params[0]))) {
-				fprintf(stderr, "Too many parameters specified\n");
+			if(add_get_param("VMon", getParams, &getCount, (int)(sizeof(getParams)/sizeof(getParams[0]))) != 0)
 				return 2;
-			}
-			snprintf(params[paramCount].name, sizeof(params[paramCount].name), "%s", "Pw");
-			snprintf(params[paramCount].value, sizeof(params[paramCount].value), "%s", "On");
-			paramCount++;
-		} else if(str_ieq(argv[i], "--PwOff")) {
-			if(paramCount >= (int)(sizeof(params)/sizeof(params[0]))) {
-				fprintf(stderr, "Too many parameters specified\n");
+		} else if(str_ieq(argv[i], "--Status")) {
+			if(add_get_param("Status", getParams, &getCount, (int)(sizeof(getParams)/sizeof(getParams[0]))) != 0)
 				return 2;
-			}
-			snprintf(params[paramCount].name, sizeof(params[paramCount].name), "%s", "Pw");
-			snprintf(params[paramCount].value, sizeof(params[paramCount].value), "%s", "Off");
-			paramCount++;
 		} else if(str_ieq(argv[i], "--ch")) {
 			int j = i + 1;
 			if(j < argc && !is_flag(argv[j]) && str_ieq(argv[j], "all")) {
@@ -465,12 +616,15 @@ static int run_cli(int argc, char **argv) {
 					return 2;
 				}
 				chList = (unsigned short*)malloc(sizeof(unsigned short) * (size_t)count);
-				if(!chList) {
-					fprintf(stderr, "Out of memory\n");
-					return 3;
-				}
+				CHECK_ALLOC_RETURN(chList);
 				for(int k = 0; k < count; k++) {
-					chList[k] = (unsigned short)atoi(argv[start + k]);
+					unsigned short chParsed = 0;
+					if(!parse_ushort_token(argv[start + k], &chParsed)) {
+						fprintf(stderr, "Invalid channel index: '%s'\n", argv[start + k]);
+						free(chList);
+						return 2;
+					}
+					chList[k] = chParsed;
 				}
 				chCount = count;
 				i = j - 1;
@@ -483,17 +637,18 @@ static int run_cli(int argc, char **argv) {
 				fprintf(stderr, "Invalid flag '%s'\n", flag);
 				return 2;
 			}
+			/* If this is a read/write parameter and no value provided, treat as getter */
+			if(is_readwrite_param(name) && (i + 1 >= argc || is_flag(argv[i+1]))) {
+				if(add_get_param(name, getParams, &getCount, (int)(sizeof(getParams)/sizeof(getParams[0]))) != 0)
+					return 2;
+				continue;
+			}
 			if(i + 1 >= argc || is_flag(argv[i+1])) {
 				fprintf(stderr, "Missing value for parameter '%s'\n", name);
 				return 2;
 			}
-			if(paramCount >= (int)(sizeof(params)/sizeof(params[0]))) {
-				fprintf(stderr, "Too many parameters specified\n");
+			if(add_set_param(params, &paramCount, (int)(sizeof(params)/sizeof(params[0])), name, argv[i+1]) != 0)
 				return 2;
-			}
-			snprintf(params[paramCount].name, sizeof(params[paramCount].name), "%s", name);
-			snprintf(params[paramCount].value, sizeof(params[paramCount].value), "%s", argv[i+1]);
-			paramCount++;
 			i++;
 		} else {
 			fprintf(stderr, "Unrecognized argument '%s'\n", argv[i]);
@@ -502,6 +657,20 @@ static int run_cli(int argc, char **argv) {
 	}
 
 	/* Minimal validation */
+	/* Apply connection defaults from config header if present (CLI overrides) */
+	{
+		CAENHV_SYSTEM_TYPE_t confSys = sysType;
+		int confLink = linkType;
+		int confSlot = slot;
+		const char *cfgPathForConn = (configPath ? configPath : DEFAULT_CONFIG_PATH);
+		int cm = read_conn_from_ch_config(cfgPathForConn, &confSys, &confLink, cfgHost, sizeof(cfgHost), cfgUser, sizeof(cfgUser), cfgPass, sizeof(cfgPass), &confSlot);
+		if(cm) {
+			if((cm & 1) && sysType == DEFAULT_SYSTEM) sysType = confSys;
+			if((cm & 2) && linkType == DEFAULT_LINK) linkType = confLink;
+			if((cm & 32) && slot < 0) slot = confSlot;
+		}
+	}
+
 	if(!chAll && (chCount <= 0 || chList == NULL)) {
 		/* If a Pw setter is present, fallback to config file to build channel list */
 		int hasPwSetter = 0;
@@ -514,8 +683,8 @@ static int run_cli(int argc, char **argv) {
 			float *cfgI0 = NULL;
 			int cfgCount = 0;
 			int lr = -1;
-			if(configPath) lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0);
-			if(lr < 0) lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0);
+			if(configPath) lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0, NULL, NULL);
+			if(lr < 0) lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0, NULL, NULL);
 			if(lr <= 0) {
 				fprintf(stderr, "No channels provided and config not found or empty. Provide --ch or a valid config.\n");
 				return 2;
@@ -525,6 +694,7 @@ static int run_cli(int argc, char **argv) {
 			chCount = cfgCount;
 			free(cfgV0);
 			free(cfgI0);
+			/* no svmax/names to free here since we passed NULL */
 		} else {
 			fprintf(stderr, "Missing channels: use --ch <list>\n");
 			print_cli_usage(argv[0]);
@@ -534,12 +704,12 @@ static int run_cli(int argc, char **argv) {
 	if(slot < 0) {
 		slot = DEFAULT_SLOT; /* default slot in code */
 	}
-	if(getParam == NULL && paramCount <= 0) {
-		fprintf(stderr, "Nothing to do. Provide setters like --V0Set 650 or a getter like --get IMon\n");
+	if(getCount <= 0 && paramCount <= 0) {
+		fprintf(stderr, "Nothing to do. Provide getters like --IMon or setters like --V0Set 650\n");
 		print_cli_usage(argv[0]);
 		return 2;
 	}
-	if(getParam != NULL && paramCount > 0) {
+	if(getCount > 0 && paramCount > 0) {
 		fprintf(stderr, "Cannot mix setters and getters in the same call. Use either --get <Param> or set flags.\n");
 		return 2;
 	}
@@ -547,19 +717,23 @@ static int run_cli(int argc, char **argv) {
 	/* Prepare connection Arg */
 	char connArg[256];
 	memset(connArg, 0, sizeof(connArg));
-	/* Fixed to TCP/IP 192.168.1.2 */
-	snprintf(connArg, sizeof(connArg), "%s", DEFAULT_HOST);
+	/* TCP/IP host (overridable with --host) */
+	{
+		const char *hostSrc = NULL;
+		if(cliHostProvided) hostSrc = host;
+		else if(cfgHost[0] != '\0') hostSrc = cfgHost;
+		else hostSrc = DEFAULT_HOST;
+		snprintf(connArg, sizeof(connArg), "%s", hostSrc);
+	}
 
 	/* Username/password defaults: match interactive logic */
 	char userBuf[64] = {0};
 	char passBuf[64] = {0};
-	if(user && pass) {
-		snprintf(userBuf, sizeof(userBuf), "%s", user);
-		snprintf(passBuf, sizeof(passBuf), "%s", pass);
-	} else {
-		/* For SY4527 / SY5527 / R6060 explicit auth is generally needed; fall back to admin/admin */
-		snprintf(userBuf, sizeof(userBuf), "%s", DEFAULT_USER);
-		snprintf(passBuf, sizeof(passBuf), "%s", DEFAULT_PASS);
+	{
+		const char *userSrc = user ? user : (cfgUser[0] ? cfgUser : DEFAULT_USER);
+		const char *passSrc = pass ? pass : (cfgPass[0] ? cfgPass : DEFAULT_PASS);
+		snprintf(userBuf, sizeof(userBuf), "%s", userSrc);
+		snprintf(passBuf, sizeof(passBuf), "%s", passSrc);
 	}
 
 	int handle = -1;
@@ -635,9 +809,9 @@ static int run_cli(int argc, char **argv) {
 			int lr = -1;
 
 			if(configPath)
-				lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0);
+				lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0, NULL, NULL);
 			if(lr < 0)
-				lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0);
+				lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0, NULL, NULL);
 
 			if(lr <= 0 || cfgCh == NULL || cfgCount <= 0) {
 				fprintf(stderr, "Unable to determine channel list for '--ch all'. "
@@ -678,50 +852,118 @@ static int run_cli(int argc, char **argv) {
 	}
 
 	int exitCode = 0;
-	if(getParam != NULL) {
-		/* Read mode */
-		unsigned long type = 0;
-		CAENHVRESULT pr = CAENHV_GetChParamProp(handle, (unsigned short)slot, chList[0], getParam, "Type", &type);
-		if(pr != CAENHV_OK) {
-			fprintf(stderr, "GetChParamProp('%s','Type') failed: %s (code %d)\n", getParam, CAENHV_GetError(handle), pr);
-			exitCode = (int)pr;
-		} else {
+	if(getCount > 0) {
+		typedef struct {
+			const char *name;
+			int isNumeric;
+			int ok;
+			float *fVals;
+			uint32_t *uVals;
+		} fetched_param_t;
+		fetched_param_t fetched[32];
+		int nf = 0;
+		/* Load config names (optional) to print alongside channel index */
+		unsigned short *cfgChForNames = NULL;
+		int cfgCntForNames = 0;
+		float *cfgTmpV0 = NULL, *cfgTmpI0 = NULL, *cfgTmpSV = NULL;
+		char **cfgNames = NULL;
+		int lrNames = -1;
+		if(configPath)
+			lrNames = load_config_file(configPath, &cfgChForNames, &cfgCntForNames, &cfgTmpV0, &cfgTmpI0, &cfgTmpSV, &cfgNames);
+		if(lrNames < 0)
+			lrNames = load_default_config(&cfgChForNames, &cfgCntForNames, &cfgTmpV0, &cfgTmpI0, &cfgTmpSV, &cfgNames);
+		/* Fetch all requested parameters first */
+		for(int gi = 0; gi < getCount; gi++) {
+			const char *par = getParams[gi];
+			unsigned long type = 0;
+			fetched[nf].name = par;
+			fetched[nf].isNumeric = 0;
+			fetched[nf].ok = 0;
+			fetched[nf].fVals = NULL;
+			fetched[nf].uVals = NULL;
+			CAENHVRESULT pr = CAENHV_GetChParamProp(handle, (unsigned short)slot, chList[0], par, "Type", &type);
+			if(pr != CAENHV_OK) {
+				fprintf(stderr, "GetChParamProp('%s','Type') failed: %s (code %d)\n", par, CAENHV_GetError(handle), pr);
+				if(exitCode == 0) exitCode = (int)pr;
+				nf++;
+				continue;
+			}
 			if(type == PARAM_TYPE_NUMERIC) {
-				float *vals = (float*)malloc(sizeof(float) * (size_t)chCount);
-				if(!vals) {
-					fprintf(stderr, "Out of memory\n");
-					exitCode = 3;
+				fetched[nf].isNumeric = 1;
+				fetched[nf].fVals = (float*)malloc(sizeof(float) * (size_t)chCount);
+				CHECK_ALLOC_SETEXIT(fetched[nf].fVals, exitCode);
+				if(!fetched[nf].fVals) { nf++; continue; }
+				CAENHVRESULT gr = CAENHV_GetChParam(handle, (unsigned short)slot, par, (unsigned short)chCount, chList, fetched[nf].fVals);
+				if(gr != CAENHV_OK) {
+					fprintf(stderr, "GetChParam('%s') failed: %s (code %d)\n", par, CAENHV_GetError(handle), gr);
+					if(exitCode == 0) exitCode = (int)gr;
+					free(fetched[nf].fVals);
+					fetched[nf].fVals = NULL;
 				} else {
-					CAENHVRESULT gr = CAENHV_GetChParam(handle, (unsigned short)slot, getParam, (unsigned short)chCount, chList, vals);
-					if(gr != CAENHV_OK) {
-						fprintf(stderr, "GetChParam('%s') failed: %s (code %d)\n", getParam, CAENHV_GetError(handle), gr);
-						exitCode = (int)gr;
-					} else {
-						for(int k = 0; k < chCount; k++) {
-							printf("Slot %d  Ch %d  %s = %.6f\n", slot, chList[k], getParam, (double)vals[k]);
-						}
-					}
-					free(vals);
+					fetched[nf].ok = 1;
 				}
 			} else {
-				unsigned long *vals = (unsigned long*)malloc(sizeof(unsigned long) * (size_t)chCount);
-				if(!vals) {
-					fprintf(stderr, "Out of memory\n");
-					exitCode = 3;
+				fetched[nf].uVals = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)chCount);
+				CHECK_ALLOC_SETEXIT(fetched[nf].uVals, exitCode);
+				if(!fetched[nf].uVals) { nf++; continue; }
+				CAENHVRESULT gr = CAENHV_GetChParam(handle, (unsigned short)slot, par, (unsigned short)chCount, chList, fetched[nf].uVals);
+				if(gr != CAENHV_OK) {
+					fprintf(stderr, "GetChParam('%s') failed: %s (code %d)\n", par, CAENHV_GetError(handle), gr);
+					if(exitCode == 0) exitCode = (int)gr;
+					free(fetched[nf].uVals);
+					fetched[nf].uVals = NULL;
 				} else {
-					CAENHVRESULT gr = CAENHV_GetChParam(handle, (unsigned short)slot, getParam, (unsigned short)chCount, chList, vals);
-					if(gr != CAENHV_OK) {
-						fprintf(stderr, "GetChParam('%s') failed: %s (code %d)\n", getParam, CAENHV_GetError(handle), gr);
-						exitCode = (int)gr;
-					} else {
-						for(int k = 0; k < chCount; k++) {
-							printf("Slot %d  Ch %d  %s = %lu\n", slot, chList[k], getParam, vals[k]);
-						}
-					}
-					free(vals);
+					fetched[nf].ok = 1;
 				}
 			}
+			nf++;
 		}
+		/* Print one line per channel with all fetched params */
+		for(int k = 0; k < chCount; k++) {
+			/* Try to find a display name for this channel from config */
+			const char *dispName = NULL;
+			if(lrNames > 0 && cfgChForNames && cfgNames) {
+				for(int ci = 0; ci < cfgCntForNames; ci++) {
+					if(cfgChForNames[ci] == chList[k]) {
+						dispName = cfgNames[ci];
+						break;
+					}
+				}
+			}
+			if(dispName && *dispName)
+				printf("Slot %d  Ch %d (%s)", slot, chList[k], dispName);
+			else
+				printf("Slot %d  Ch %d", slot, chList[k]);
+			for(int fi = 0; fi < nf; fi++) {
+				if(!fetched[fi].ok) continue;
+				if(fetched[fi].isNumeric) {
+					printf("  %s = %.6f", fetched[fi].name, (double)fetched[fi].fVals[k]);
+				} else {
+					uint32_t v = fetched[fi].uVals[k];
+					if(str_ieq(fetched[fi].name, "Status")) {
+						// printf("  %s = %x (%s)", fetched[fi].name, (unsigned int)v, status_label(v));
+						printf("  %s = %s", fetched[fi].name, status_label(v));
+					} else {
+						printf("  %s = %x", fetched[fi].name, (unsigned int)v);
+					}
+				}
+			}
+			printf("\n");
+		}
+		/* Cleanup */
+		for(int fi = 0; fi < nf; fi++) {
+			if(fetched[fi].fVals) free(fetched[fi].fVals);
+			if(fetched[fi].uVals) free(fetched[fi].uVals);
+		}
+		/* Free config name resources */
+		if(cfgNames) {
+			for(int ci = 0; ci < cfgCntForNames; ci++) free(cfgNames[ci]);
+			free(cfgNames);
+		}
+		free(cfgChForNames);
+		free(cfgTmpV0);
+		free(cfgTmpI0);
+		free(cfgTmpSV);
 	} else {
 		/* Set mode */
 		/* If turning power On/Off and channels came from config, apply V0Set/I0Set per-channel from config first */
@@ -732,13 +974,23 @@ static int run_cli(int argc, char **argv) {
 				unsigned short *cfgCh = NULL;
 				float *cfgV0 = NULL;
 				float *cfgI0 = NULL;
+				float *cfgSV = NULL;
 				int cfgCount = 0;
 				int lr = -1;
-				if(configPath) lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0);
-				if(lr < 0) lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0);
+				if(configPath) lr = load_config_file(configPath, &cfgCh, &cfgCount, &cfgV0, &cfgI0, &cfgSV, NULL);
+				if(lr < 0) lr = load_default_config(&cfgCh, &cfgCount, &cfgV0, &cfgI0, &cfgSV, NULL);
 				if(lr > 0) {
 					for(int idx = 0; idx < cfgCount; idx++) {
 						unsigned short oneCh = cfgCh[idx];
+						/* Apply SVMax if provided (> 0) before V/I */
+						if(cfgSV && cfgSV[idx] > 0.0f) {
+							float sv = cfgSV[idx];
+							CAENHVRESULT sr0 = CAENHV_SetChParam(handle, (unsigned short)slot, "SVMax", 1, &oneCh, &sv);
+							if(sr0 != CAENHV_OK) {
+								fprintf(stderr, "SetChParam('SVMax', %.3f) ch %u failed: %s (code %d)\n", (double)sv, oneCh, CAENHV_GetError(handle), sr0);
+								exitCode = (int)sr0;
+							}
+						}
 						float v0 = cfgV0[idx];
 						float i0 = cfgI0[idx];
 						CAENHVRESULT sr1 = CAENHV_SetChParam(handle, (unsigned short)slot, "V0Set", 1, &oneCh, &v0);
@@ -756,6 +1008,7 @@ static int run_cli(int argc, char **argv) {
 				free(cfgCh);
 				free(cfgV0);
 				free(cfgI0);
+				free(cfgSV);
 			}
 		}
 		for(i = 0; i < paramCount; i++) {

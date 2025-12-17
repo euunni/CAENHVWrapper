@@ -202,10 +202,10 @@ extern void Sleep(unsigned int x);
 #define LINKTYPE_TCPIP				0
 #define LINKTYPE_RS232				1
 #define LINKTYPE_CAENET				2
-#define LINKTYPE_USB				3
+#define LINKTYPE_USB				  3
 #define LINKTYPE_OPTLINK			4
 #define LINKTYPE_USB_VCP			5
-#define LINKTYPE_USB3				6
+#define LINKTYPE_USB3				  6
 #define LINKTYPE_A4818				7
 
 
