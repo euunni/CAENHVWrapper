@@ -931,13 +931,19 @@ static int run_cli(int argc, char **argv) {
 				}
 			}
 			if(dispName && *dispName)
-				printf("Slot %d  Ch %d (%s)", slot, chList[k], dispName);
+				printf("%02d-%02d (%s)", slot, chList[k], dispName);
 			else
-				printf("Slot %d  Ch %d", slot, chList[k]);
+				printf("%02d-%02d", slot, chList[k]);
 			for(int fi = 0; fi < nf; fi++) {
 				if(!fetched[fi].ok) continue;
 				if(fetched[fi].isNumeric) {
-					printf("  %s = %.6f", fetched[fi].name, (double)fetched[fi].fVals[k]);
+					/* Show VMon/IMon/V0Set/I0Set with 2 decimal places; others keep 6 */
+					if(str_ieq(fetched[fi].name, "VMon") || str_ieq(fetched[fi].name, "IMon") ||
+						str_ieq(fetched[fi].name, "V0Set") || str_ieq(fetched[fi].name, "I0Set")) {
+						printf("  %s = %.2f", fetched[fi].name, (double)fetched[fi].fVals[k]);
+					} else {
+						printf("  %s = %.6f", fetched[fi].name, (double)fetched[fi].fVals[k]);
+					}
 				} else {
 					uint32_t v = fetched[fi].uVals[k];
 					if(str_ieq(fetched[fi].name, "Status")) {
